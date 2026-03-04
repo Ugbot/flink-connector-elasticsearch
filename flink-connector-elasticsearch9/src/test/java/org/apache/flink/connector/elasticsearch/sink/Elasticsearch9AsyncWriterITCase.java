@@ -244,7 +244,9 @@ public class Elasticsearch9AsyncWriterITCase extends ElasticsearchSinkBaseITCase
                         5 * 1024 * 1024,
                         5000,
                         1024 * 1024,
-                        new NetworkConfig(esHost, null, null, null, null)) {
+                        new NetworkConfig(esHost, null, null, null, null),
+                        new DefaultBulkItemFailureHandler(),
+                        null) {
                     @Override
                     public StatefulSinkWriter createWriter(InitContext context) {
                         return new Elasticsearch9AsyncWriter<DummyData>(
@@ -257,6 +259,8 @@ public class Elasticsearch9AsyncWriterITCase extends ElasticsearchSinkBaseITCase
                                 getMaxTimeInBufferMS(),
                                 getMaxRecordSizeInBytes(),
                                 networkConfig,
+                                new DefaultBulkItemFailureHandler(),
+                                null,
                                 Collections.emptyList()) {
                             @Override
                             protected void submitRequestEntries(

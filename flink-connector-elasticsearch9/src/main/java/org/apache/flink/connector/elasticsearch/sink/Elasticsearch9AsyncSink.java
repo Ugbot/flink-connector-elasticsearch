@@ -44,6 +44,8 @@ public class Elasticsearch9AsyncSink<InputT> extends AsyncSinkBase<InputT, Opera
     private static final Logger LOG = LoggerFactory.getLogger(Elasticsearch9AsyncSink.class);
 
     @VisibleForTesting protected final NetworkConfig networkConfig;
+    private final BulkItemFailureHandler failureHandler;
+    private final String deadLetterIndex;
 
     protected Elasticsearch9AsyncSink(
             ElementConverter<InputT, Operation> converter,
@@ -53,7 +55,9 @@ public class Elasticsearch9AsyncSink<InputT> extends AsyncSinkBase<InputT, Opera
             long maxBatchSizeInBytes,
             long maxTimeInBufferMS,
             long maxRecordSizeInByte,
-            NetworkConfig networkConfig) {
+            NetworkConfig networkConfig,
+            BulkItemFailureHandler failureHandler,
+            String deadLetterIndex) {
         super(
                 converter,
                 maxBatchSize,
@@ -64,6 +68,8 @@ public class Elasticsearch9AsyncSink<InputT> extends AsyncSinkBase<InputT, Opera
                 maxRecordSizeInByte);
 
         this.networkConfig = networkConfig;
+        this.failureHandler = failureHandler;
+        this.deadLetterIndex = deadLetterIndex;
     }
 
     @Override
@@ -79,6 +85,8 @@ public class Elasticsearch9AsyncSink<InputT> extends AsyncSinkBase<InputT, Opera
                 getMaxTimeInBufferMS(),
                 getMaxRecordSizeInBytes(),
                 networkConfig,
+                failureHandler,
+                deadLetterIndex,
                 Collections.emptyList());
     }
 
@@ -95,6 +103,8 @@ public class Elasticsearch9AsyncSink<InputT> extends AsyncSinkBase<InputT, Opera
                 getMaxTimeInBufferMS(),
                 getMaxRecordSizeInBytes(),
                 networkConfig,
+                failureHandler,
+                deadLetterIndex,
                 recoveredState);
     }
 

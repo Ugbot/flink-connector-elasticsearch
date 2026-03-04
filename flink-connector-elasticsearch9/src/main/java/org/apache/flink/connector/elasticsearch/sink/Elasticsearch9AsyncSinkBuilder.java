@@ -81,6 +81,12 @@ public class Elasticsearch9AsyncSinkBuilder<InputT>
 
     private SerializableSupplier<SSLContext> sslContextSupplier;
 
+    /** Handler for individual bulk item failures. Defaults to {@link DefaultBulkItemFailureHandler}. */
+    private BulkItemFailureHandler failureHandler;
+
+    /** Elasticsearch index to write non-retryable failures to. Null means DLQ is disabled. */
+    private String deadLetterIndex;
+
     /**
      * setHosts set the hosts where the Elasticsearch cluster is reachable.
      *
@@ -193,6 +199,41 @@ public class Elasticsearch9AsyncSinkBuilder<InputT>
         return this;
     }
 
+    /**
+     * Sets the failure handler for individual bulk item failures.
+     *
+     * <p>Defaults to {@link DefaultBulkItemFailureHandler} which retries transient errors and fails
+     * the job on non-retryable errors.
+     *
+     * @param failureHandler the failure handler
+     * @return this builder
+     */
+    public Elasticsearch9AsyncSinkBuilder<InputT> setFailureHandler(
+            BulkItemFailureHandler failureHandler) {
+        this.failureHandler = checkNotNull(failureHandler, "failureHandler must not be null");
+        return this;
+    }
+
+    /**
+     * Sets the Elasticsearch index to write non-retryable failures to (Dead Letter Queue).
+     *
+     * <p>When set, items that fail with non-retryable errors (e.g. mapping exceptions) are written
+     * to this index instead of being discarded. The DLQ document includes error details, timestamp,
+     * and the original target index.
+     *
+     * <p>DLQ is disabled by default. If a DLQ write itself fails, a warning is logged but the job
+     * continues.
+     *
+     * @param deadLetterIndex the Elasticsearch index name for dead letter records
+     * @return this builder
+     */
+    public Elasticsearch9AsyncSinkBuilder<InputT> setDeadLetterIndex(String deadLetterIndex) {
+        checkNotNull(deadLetterIndex, "deadLetterIndex must not be null");
+        checkArgument(!deadLetterIndex.isEmpty(), "deadLetterIndex must not be empty");
+        this.deadLetterIndex = deadLetterIndex;
+        return this;
+    }
+
     public static <T> Elasticsearch9AsyncSinkBuilder<T> builder() {
         return new Elasticsearch9AsyncSinkBuilder<>();
     }
@@ -213,7 +254,9 @@ public class Elasticsearch9AsyncSinkBuilder<InputT>
                 Optional.ofNullable(getMaxBatchSizeInBytes()).orElse(DEFAULT_MAX_BATCH_SIZE_IN_B),
                 Optional.ofNullable(getMaxTimeInBufferMS()).orElse(DEFAULT_MAX_TIME_IN_BUFFER_MS),
                 Optional.ofNullable(getMaxRecordSizeInBytes()).orElse(DEFAULT_MAX_RECORD_SIZE_IN_B),
-                buildNetworkConfig());
+                buildNetworkConfig(),
+                Optional.ofNullable(failureHandler).orElse(new DefaultBulkItemFailureHandler()),
+                deadLetterIndex);
     }
 
     private OperationConverter<InputT> buildOperationConverter(

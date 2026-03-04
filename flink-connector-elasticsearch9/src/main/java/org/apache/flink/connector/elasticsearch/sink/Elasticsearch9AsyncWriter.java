@@ -36,9 +36,12 @@ import co.elastic.clients.elasticsearch.core.BulkRequest;
 import co.elastic.clients.elasticsearch.core.BulkResponse;
 import co.elastic.clients.elasticsearch.core.bulk.BulkOperation;
 import co.elastic.clients.elasticsearch.core.bulk.BulkResponseItem;
+import co.elastic.clients.elasticsearch.core.bulk.IndexOperation;
 import co.elastic.clients.transport.rest5_client.low_level.ResponseException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.net.ConnectException;
 import java.net.NoRouteToHostException;
@@ -74,15 +77,19 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
     /** A counter to track non-retryable items that were dropped. */
     private final Counter numRecordsDroppedCounter;
 
+    /** A counter to track records sent to the DLQ. */
+    private final Counter numRecordsSentToDlqCounter;
+    /** A counter to track items that caused the job to fail. */
+    private final Counter numRecordsFatalFailureCounter;
+
     /** Cached serializer instance to avoid Kryo instantiation per record. */
     private final OperationSerializer operationSerializer = new OperationSerializer();
 
-    /** Set of error types from Elasticsearch that indicate a retryable condition. */
-    private static final java.util.Set<String> RETRYABLE_ES_ERROR_TYPES =
-            java.util.Set.of(
-                    "es_rejected_execution_exception",
-                    "circuit_breaking_exception",
-                    "too_many_requests");
+    /** Handler for individual bulk item failures. */
+    private final BulkItemFailureHandler failureHandler;
+
+    /** Elasticsearch index for dead letter records. Null if DLQ is disabled. */
+    @Nullable private final String deadLetterIndex;
 
     private static final FatalExceptionClassifier ELASTICSEARCH_FATAL_EXCEPTION_CLASSIFIER =
             FatalExceptionClassifier.createChain(
@@ -120,6 +127,8 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
             long maxTimeInBufferMS,
             long maxRecordSizeInBytes,
             NetworkConfig networkConfig,
+            BulkItemFailureHandler failureHandler,
+            @Nullable String deadLetterIndex,
             Collection<BufferedRequestState<Operation>> state) {
         super(
                 elementConverter,
@@ -135,6 +144,9 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
                 state);
 
         this.esClient = networkConfig.createEsClient();
+        this.failureHandler = checkNotNull(failureHandler);
+        this.deadLetterIndex = deadLetterIndex;
+
         final SinkWriterMetricGroup metricGroup = context.metricGroup();
         checkNotNull(metricGroup);
 
@@ -143,6 +155,8 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
                 metricGroup.counter("numRecordsSendPartialFailure");
         this.numRequestSubmittedCounter = metricGroup.counter("numRequestSubmitted");
         this.numRecordsDroppedCounter = metricGroup.counter("numRecordsDropped");
+        this.numRecordsSentToDlqCounter = metricGroup.counter("numRecordsSentToDlq");
+        this.numRecordsFatalFailureCounter = metricGroup.counter("numRecordsFatalFailure");
     }
 
     @Override
@@ -204,13 +218,28 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
         LOG.debug("The BulkRequest has failed partially. Response: {}", response);
         ArrayList<Operation> retryableItems = new ArrayList<>();
         int droppedCount = 0;
+        boolean hasFatalFailure = false;
+        String fatalMessage = null;
 
         for (int i = 0; i < response.items().size(); i++) {
             BulkResponseItem item = response.items().get(i);
-            if (item.error() != null) {
-                if (isItemRetryable(item.status(), item.error().type())) {
-                    retryableItems.add(requestEntries.get(i));
-                } else {
+            if (item.error() == null) {
+                continue;
+            }
+
+            Operation failedOp = requestEntries.get(i);
+            BulkItemFailureHandler.Decision decision =
+                    failureHandler.onItemFailure(
+                            item.status(),
+                            item.error().type(),
+                            item.error().reason(),
+                            failedOp);
+
+            switch (decision) {
+                case RETRY:
+                    retryableItems.add(failedOp);
+                    break;
+                case DROP:
                     droppedCount++;
                     LOG.warn(
                             "Dropping non-retryable item: index={}, status={}, errorType={}, reason={}",
@@ -218,7 +247,22 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
                             item.status(),
                             item.error().type(),
                             item.error().reason());
-                }
+                    sendToDlqIfConfigured(item);
+                    break;
+                case FAIL:
+                    hasFatalFailure = true;
+                    numRecordsFatalFailureCounter.inc();
+                    fatalMessage =
+                            String.format(
+                                    "Non-retryable item failure: index=%s, status=%d, errorType=%s, reason=%s",
+                                    item.index(),
+                                    item.status(),
+                                    item.error().type(),
+                                    item.error().reason());
+                    LOG.error(fatalMessage);
+                    break;
+                default:
+                    break;
             }
         }
 
@@ -234,31 +278,57 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
                 droppedCount,
                 response.took());
         requestResult.accept(retryableItems);
+
+        if (hasFatalFailure) {
+            getFatalExceptionCons()
+                    .accept(new FlinkRuntimeException(fatalMessage));
+        }
     }
 
-    /**
-     * Determines if a bulk item failure is retryable based on HTTP status and error type.
-     *
-     * <p>Retryable conditions (matching ES7 parity and production patterns):
-     *
-     * <ul>
-     *   <li>HTTP 429 (Too Many Requests)
-     *   <li>HTTP 5xx (server errors)
-     *   <li>es_rejected_execution_exception (thread pool saturation)
-     *   <li>circuit_breaking_exception (memory pressure)
-     * </ul>
-     */
-    private boolean isItemRetryable(int status, String errorType) {
-        if (status == 429) {
-            return true;
+    private void sendToDlqIfConfigured(BulkResponseItem item) {
+        if (deadLetterIndex == null) {
+            return;
         }
-        if (status >= 500 && status <= 599) {
-            return true;
+
+        try {
+            DeadLetterRecord dlqRecord =
+                    new DeadLetterRecord(
+                            item.index(),
+                            item.status(),
+                            item.error().type(),
+                            item.error().reason(),
+                            item.operationType() != null
+                                    ? item.operationType().jsonValue()
+                                    : "unknown");
+
+            IndexOperation<java.util.Map<String, Object>> indexOp =
+                    IndexOperation.of(op -> op.index(deadLetterIndex).document(dlqRecord.toMap()));
+            BulkRequest dlqRequest =
+                    BulkRequest.of(
+                            br -> br.operations(new BulkOperation(indexOp)));
+
+            esClient.bulk(dlqRequest)
+                    .whenComplete(
+                            (dlqResponse, dlqError) -> {
+                                if (dlqError != null) {
+                                    LOG.warn(
+                                            "Failed to write to DLQ index '{}': {}",
+                                            deadLetterIndex,
+                                            dlqError.getMessage());
+                                } else if (dlqResponse.errors()) {
+                                    LOG.warn(
+                                            "DLQ write to '{}' returned errors",
+                                            deadLetterIndex);
+                                } else {
+                                    numRecordsSentToDlqCounter.inc();
+                                    LOG.debug(
+                                            "Successfully wrote failed item to DLQ index '{}'",
+                                            deadLetterIndex);
+                                }
+                            });
+        } catch (Exception e) {
+            LOG.warn("Failed to construct DLQ record for index '{}': {}", deadLetterIndex, e.getMessage());
         }
-        if (errorType != null && RETRYABLE_ES_ERROR_TYPES.contains(errorType)) {
-            return true;
-        }
-        return false;
     }
 
     private void handleSuccessfulRequest(
