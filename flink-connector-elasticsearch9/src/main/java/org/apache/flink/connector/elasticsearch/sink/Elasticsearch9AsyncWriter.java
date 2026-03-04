@@ -35,6 +35,8 @@ import co.elastic.clients.elasticsearch.ElasticsearchAsyncClient;
 import co.elastic.clients.elasticsearch.core.BulkRequest;
 import co.elastic.clients.elasticsearch.core.BulkResponse;
 import co.elastic.clients.elasticsearch.core.bulk.BulkOperation;
+import co.elastic.clients.elasticsearch.core.bulk.BulkResponseItem;
+import co.elastic.clients.transport.rest5_client.low_level.ResponseException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,6 +71,18 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
     private final Counter numRecordsSendPartialFailureCounter;
     /** A counter to track the number of bulk requests that are sent to Elasticsearch. */
     private final Counter numRequestSubmittedCounter;
+    /** A counter to track non-retryable items that were dropped. */
+    private final Counter numRecordsDroppedCounter;
+
+    /** Cached serializer instance to avoid Kryo instantiation per record. */
+    private final OperationSerializer operationSerializer = new OperationSerializer();
+
+    /** Set of error types from Elasticsearch that indicate a retryable condition. */
+    private static final java.util.Set<String> RETRYABLE_ES_ERROR_TYPES =
+            java.util.Set.of(
+                    "es_rejected_execution_exception",
+                    "circuit_breaking_exception",
+                    "too_many_requests");
 
     private static final FatalExceptionClassifier ELASTICSEARCH_FATAL_EXCEPTION_CLASSIFIER =
             FatalExceptionClassifier.createChain(
@@ -79,7 +93,22 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
                             err ->
                                     new FlinkRuntimeException(
                                             "Could not connect to Elasticsearch cluster using the provided hosts",
-                                            err)));
+                                            err)),
+                    new FatalExceptionClassifier(
+                            err -> {
+                                if (err instanceof ResponseException) {
+                                    int status =
+                                            ((ResponseException) err)
+                                                    .getResponse()
+                                                    .getStatusCode();
+                                    // 4xx client errors (except 429) are fatal
+                                    return status >= 400 && status < 500 && status != 429;
+                                }
+                                return false;
+                            },
+                            err ->
+                                    new FlinkRuntimeException(
+                                            "Non-retryable Elasticsearch client error", err)));
 
     public Elasticsearch9AsyncWriter(
             ElementConverter<InputT, Operation> elementConverter,
@@ -113,6 +142,7 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
         this.numRecordsSendPartialFailureCounter =
                 metricGroup.counter("numRecordsSendPartialFailure");
         this.numRequestSubmittedCounter = metricGroup.counter("numRequestSubmitted");
+        this.numRecordsDroppedCounter = metricGroup.counter("numRecordsDropped");
     }
 
     @Override
@@ -151,8 +181,19 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
         LOG.debug("The BulkRequest has failed", error);
         numRecordsOutErrorsCounter.inc(requestEntries.size());
 
-        if (isRetryable(error.getCause())) {
+        Throwable cause = error.getCause() != null ? error.getCause() : error;
+        if (isRetryable(cause)) {
             requestResult.accept(requestEntries);
+        } else {
+            // Must complete the callback to avoid hanging the pipeline
+            requestResult.accept(Collections.emptyList());
+            getFatalExceptionCons()
+                    .accept(
+                            new FlinkRuntimeException(
+                                    "Non-retryable Elasticsearch error in bulk request of "
+                                            + requestEntries.size()
+                                            + " operation(s)",
+                                    error));
         }
     }
 
@@ -161,21 +202,63 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
             Consumer<List<Operation>> requestResult,
             BulkResponse response) {
         LOG.debug("The BulkRequest has failed partially. Response: {}", response);
-        ArrayList<Operation> failedItems = new ArrayList<>();
+        ArrayList<Operation> retryableItems = new ArrayList<>();
+        int droppedCount = 0;
+
         for (int i = 0; i < response.items().size(); i++) {
-            if (response.items().get(i).error() != null) {
-                failedItems.add(requestEntries.get(i));
+            BulkResponseItem item = response.items().get(i);
+            if (item.error() != null) {
+                if (isItemRetryable(item.status(), item.error().type())) {
+                    retryableItems.add(requestEntries.get(i));
+                } else {
+                    droppedCount++;
+                    LOG.warn(
+                            "Dropping non-retryable item: index={}, status={}, errorType={}, reason={}",
+                            item.index(),
+                            item.status(),
+                            item.error().type(),
+                            item.error().reason());
+                }
             }
         }
 
-        numRecordsOutErrorsCounter.inc(failedItems.size());
-        numRecordsSendPartialFailureCounter.inc(failedItems.size());
+        int totalFailures = retryableItems.size() + droppedCount;
+        numRecordsOutErrorsCounter.inc(totalFailures);
+        numRecordsSendPartialFailureCounter.inc(retryableItems.size());
+        numRecordsDroppedCounter.inc(droppedCount);
         LOG.info(
-                "The BulkRequest with {} operation(s) has {} failure(s). It took {}ms",
+                "The BulkRequest with {} operation(s) has {} failure(s) ({} retryable, {} dropped). It took {}ms",
                 requestEntries.size(),
-                failedItems.size(),
+                totalFailures,
+                retryableItems.size(),
+                droppedCount,
                 response.took());
-        requestResult.accept(failedItems);
+        requestResult.accept(retryableItems);
+    }
+
+    /**
+     * Determines if a bulk item failure is retryable based on HTTP status and error type.
+     *
+     * <p>Retryable conditions (matching ES7 parity and production patterns):
+     *
+     * <ul>
+     *   <li>HTTP 429 (Too Many Requests)
+     *   <li>HTTP 5xx (server errors)
+     *   <li>es_rejected_execution_exception (thread pool saturation)
+     *   <li>circuit_breaking_exception (memory pressure)
+     * </ul>
+     */
+    private boolean isItemRetryable(int status, String errorType) {
+        if (status == 429) {
+            return true;
+        }
+        if (status >= 500 && status <= 599) {
+            return true;
+        }
+        if (errorType != null && RETRYABLE_ES_ERROR_TYPES.contains(errorType)) {
+            return true;
+        }
+        return false;
     }
 
     private void handleSuccessfulRequest(
@@ -193,7 +276,7 @@ public class Elasticsearch9AsyncWriter<InputT> extends AsyncSinkWriter<InputT, O
 
     @Override
     protected long getSizeInBytes(Operation requestEntry) {
-        return new OperationSerializer().size(requestEntry);
+        return operationSerializer.size(requestEntry);
     }
 
     @Override
