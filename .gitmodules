@@ -2,3 +2,6 @@
 	path = tools/releasing/shared
 	url = https://github.com/apache/flink-connector-shared-utils
 	branch = release_utils
+[submodule "elasticsearch-java-reference"]
+	path = elasticsearch-java-reference
+	url = https://github.com/elastic/elasticsearch-java.git
